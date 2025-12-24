@@ -971,6 +971,14 @@ impl crate::Instance for Instance {
                 (display, WindowKind::AngleX11)
             }
             (Some(Rdh::Xcb(_xcb_display_handle)), Some(_egl)) => todo!("xcb"),
+            (Some(Rdh::Ge8300FBDev(fbdev_display_handle)), None) => {
+                log::debug!("Using Ge8300 FBDev platform");
+                let display = unsafe { egl.get_display(fbdev_display_handle.fbdev_display) }
+                    .ok_or_else(|| {
+                        crate::InstanceError::new("Failed to get default display".into())
+                    })?;
+                (display, WindowKind::Unknown)
+            }
             x if client_ext_str.contains("EGL_MESA_platform_surfaceless") => {
                 log::debug!(
                     "No (or unknown) windowing system ({x:?}) present. Using surfaceless platform"
@@ -1102,6 +1110,7 @@ impl crate::Instance for Instance {
             (Rwh::Wayland(_), _) => {}
             #[cfg(Emscripten)]
             (Rwh::Web(_), _) => {}
+            (Rwh::Ge8300FBDev(_), _) => {}
             other => {
                 return Err(crate::InstanceError::new(format!(
                     "unsupported window: {other:?}"
@@ -1437,6 +1446,7 @@ impl crate::Surface for Surface {
                         wl_window = Some(window);
                         window.cast()
                     }
+                    (WindowKind::Unknown, Rwh::Ge8300FBDev(handle)) => handle.fbdev_window,
                     #[cfg(Emscripten)]
                     (WindowKind::Unknown, Rwh::Web(handle)) => handle.id as *mut ffi::c_void,
                     (WindowKind::Unknown, Rwh::Win32(handle)) => {
