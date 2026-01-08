@@ -93,6 +93,7 @@ fn choose_config(
     egl: &EglInstance,
     display: khronos_egl::Display,
     srgb_kind: SrgbFrameBufferKind,
+    need_native_renderable: bool,
 ) -> Result<(khronos_egl::Config, bool), crate::InstanceError> {
     //TODO: EGL_SLOW_CONFIG
     let tiers = [
@@ -143,12 +144,7 @@ fn choose_config(
                     log::info!("EGL says it can present to the window but not natively",);
                 }
                 // Android emulator can't natively present either.
-                let tier_threshold =
-                    if cfg!(target_os = "android") || cfg!(windows) || cfg!(target_env = "ohos") {
-                        1
-                    } else {
-                        2
-                    };
+                let tier_threshold = if !need_native_renderable { 1 } else { 2 };
                 return Ok((config, tier_max >= tier_threshold));
             }
             Ok(None) => {
@@ -395,6 +391,7 @@ impl Inner {
         egl: Arc<EglInstance>,
         display: khronos_egl::Display,
         force_gles_minor_version: wgt::Gles3MinorVersion,
+        need_native_renderable: bool,
     ) -> Result<Self, crate::InstanceError> {
         let version = initialize_display(&egl, display)
             .map_err(instance_err("failed to initialize EGL display connection"))?;
@@ -441,7 +438,8 @@ impl Inner {
             }
         }
 
-        let (config, supports_native_window) = choose_config(&egl, display, srgb_kind)?;
+        let (config, supports_native_window) =
+            choose_config(&egl, display, srgb_kind, need_native_renderable)?;
 
         let supports_opengl = if version >= (1, 4) {
             let client_apis = egl
@@ -680,6 +678,8 @@ pub struct Instance {
     flags: wgt::InstanceFlags,
     options: wgt::GlBackendOptions,
     inner: Mutex<Inner>,
+    #[cfg(not(Emscripten))]
+    gl_library: Option<Arc<libloading::Library>>,
 }
 
 impl Instance {
@@ -758,6 +758,9 @@ impl crate::Instance for Instance {
         #[cfg(Emscripten)]
         let egl1_5: Option<&Arc<EglInstance>> = Some(&egl);
 
+        let mut need_native_renderable =
+            cfg!(target_os = "android") || cfg!(windows) || cfg!(target_env = "ohos");
+
         let (display, wsi_kind) = match (desc.display.map(|d| d.as_raw()), egl1_5) {
             (Some(Rdh::Wayland(wayland_display_handle)), Some(egl))
                 if client_ext_str.contains("EGL_EXT_platform_wayland") =>
@@ -813,6 +816,15 @@ impl crate::Instance for Instance {
                 }
                 .map_err(instance_err("failed to get Angle display"))?;
                 (display, WindowKind::AngleX11)
+            }
+            (Some(Rdh::Gbm(display)), _) => {
+                log::debug!("Using GBM platform");
+                need_native_renderable = false;
+                let display = unsafe { egl.get_display(display.gbm_device.as_ptr() as *mut _) }
+                    .ok_or_else(|| {
+                        crate::InstanceError::new("Failed to get default display".into())
+                    })?;
+                (display, WindowKind::Unknown)
             }
             (Some(Rdh::Xcb(_xcb_display_handle)), Some(_egl)) => todo!("xcb"),
             x if client_ext_str.contains("EGL_MESA_platform_surfaceless") => {
@@ -878,6 +890,7 @@ impl crate::Instance for Instance {
             egl,
             display,
             desc.backend_options.gl.gles_minor_version,
+            need_native_renderable,
         )?;
 
         Ok(Instance {
@@ -885,6 +898,15 @@ impl crate::Instance for Instance {
             flags: desc.flags,
             options: desc.backend_options.gl.clone(),
             inner: Mutex::new(inner),
+            #[cfg(not(Emscripten))]
+            gl_library: desc
+                .backend_options
+                .gl
+                .gl_library
+                .as_ref()
+                .map_or(None, |path| {
+                    unsafe { libloading::Library::new(path) }.map(Arc::new).ok()
+                }),
         })
     }
 
@@ -937,6 +959,7 @@ impl crate::Instance for Instance {
             (Rwh::Wayland(_), _) => {}
             #[cfg(Emscripten)]
             (Rwh::Web(_), _) => {}
+            (Rwh::Gbm(_), _) => {}
             other => {
                 return Err(crate::InstanceError::new(format!(
                     "unsupported window: {other:?}"
@@ -964,14 +987,43 @@ impl crate::Instance for Instance {
         let inner = self.inner.lock();
         inner.egl.make_current();
 
-        let mut gl = unsafe {
-            glow::Context::from_loader_function(|name| {
+        let mut gl = {
+            let egl_load_func = |name: &str| {
                 inner
                     .egl
                     .instance
                     .get_proc_address(name)
                     .map_or(ptr::null(), |p| p as *const _)
-            })
+            };
+
+            #[cfg(not(Emscripten))]
+            {
+                if let Some(ref library) = self.gl_library {
+                    unsafe {
+                        glow::Context::from_loader_function(|name| {
+                            let symbol_name = std::ffi::CString::new(name).unwrap();
+                            let ptr = match library
+                                .get::<*const ffi::c_void>(symbol_name.as_bytes_with_nul())
+                            {
+                                Ok(symbol) => *symbol,
+                                Err(_) => ptr::null(),
+                            };
+                            if ptr.is_null() {
+                                egl_load_func(name)
+                            } else {
+                                ptr
+                            }
+                        })
+                    }
+                } else {
+                    unsafe { glow::Context::from_loader_function(egl_load_func) }
+                }
+            }
+
+            #[cfg(Emscripten)]
+            {
+                unsafe { glow::Context::from_loader_function(egl_load_func) }
+            }
         };
 
         // In contrast to OpenGL ES, OpenGL requires explicitly enabling sRGB conversions,
@@ -1260,6 +1312,9 @@ impl crate::Surface for Surface {
                             layer.cast::<ffi::c_void>()
                         };
                         window_ptr
+                    }
+                    (WindowKind::Unknown, Rwh::Gbm(handle)) => {
+                        handle.gbm_surface.as_ptr() as *mut ffi::c_void
                     }
                     _ => {
                         log::warn!(
